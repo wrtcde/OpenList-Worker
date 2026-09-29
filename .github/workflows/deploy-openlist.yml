@@ -112,7 +112,7 @@ jobs:
         run: pnpm run build
 
       - name: Deploy
-        run: pnpm exec wrangler deploy -c wrangler.ci.jsonc --yes
+        run: pnpm exec wrangler deploy -c wrangler.ci.jsonc
 
       # Secrets 不会被下次 deploy 覆盖，重复写入只为保证幂等
       - name: Ensure JWT_SECRET
