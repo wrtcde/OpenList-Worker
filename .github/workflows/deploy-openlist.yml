@@ -1,0 +1,123 @@
+# OpenList-Worker → Cloudflare Workers（GitHub Actions 负责构建与部署，本机不需要 Node）
+#
+# 需要的 Repository Secrets（Settings → Secrets and variables → Actions）：
+#   CLOUDFLARE_API_TOKEN   自定义令牌：Account/Account Settings=Read、
+#                          Account/Workers Scripts=Edit、Account/Workers D1=Edit、
+#                          Account/Workers Routes=Edit、User/User Details=Read
+#   CLOUDFLARE_ACCOUNT_ID  CF 控制台首页右侧的 Account ID
+#   JWT_SECRET             Worker 的 JWT 签名密钥（>=16 字符）
+#
+# 不改动仓库里任何上游文件：部署用的 wrangler 配置由本流程临时生成
+# （wrangler.ci.jsonc），因此随时可以点 GitHub 的 "Sync fork" 拉上游更新。
+
+name: deploy-openlist
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "scripts/**"
+      - "package.json"
+      - "pnpm-lock.yaml"
+      - ".github/workflows/deploy-openlist.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-openlist
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    name: Build & deploy to Cloudflare Workers
+
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      # 想换 Worker 名字/D1 名字只改这两行
+      WORKER_NAME: openlist
+      D1_NAME: openlist-db
+      D1_BINDING: DB
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # 版本取自仓库 package.json 的 packageManager 字段（pnpm@9.15.4）
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Ensure D1 database exists
+        run: |
+          set -euo pipefail
+          api="https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/d1/database"
+          id=$(curl -sS -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" "$api?per_page=100" \
+            | jq -r --arg n "$D1_NAME" '.result[]? | select(.name==$n) | .uuid' | head -n1 || true)
+          if [ -z "${id:-}" ] || [ "$id" = "null" ]; then
+            id=$(curl -sS -X POST \
+              -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              -H "Content-Type: application/json" \
+              --data "{\"name\":\"$D1_NAME\"}" "$api" | jq -r '.result.uuid // empty')
+          fi
+          if [ -z "${id:-}" ] || [ "$id" = "null" ]; then
+            echo "::error::找不到也无法创建 D1 数据库 $D1_NAME —— 请检查 token 是否含 Workers D1: Edit 权限"
+            exit 1
+          fi
+          echo "D1_DATABASE_ID=$id" >> "$GITHUB_ENV"
+          echo "D1: $D1_NAME -> $id"
+
+      - name: Write the wrangler config used by this deploy
+        run: |
+          cat > wrangler.ci.jsonc <<EOF
+          {
+            "name": "$WORKER_NAME",
+            "main": "src/backend/worker.ts",
+            "compatibility_date": "2026-08-04",
+            "compatibility_flags": ["nodejs_compat"],
+            "workers_dev": true,
+            "preview_urls": false,
+            "vars": {
+              "ENVIRONMENT": "production",
+              "DB_FORMAT": "sql",
+              "DB_DRIVER": "d1"
+            },
+            "assets": {
+              "directory": "./dist",
+              "binding": "ASSETS",
+              "run_worker_first": ["/", "/index.html"]
+            },
+            "d1_databases": [
+              {
+                "binding": "$D1_BINDING",
+                "database_name": "$D1_NAME",
+                "database_id": "$D1_DATABASE_ID"
+              }
+            ]
+          }
+          EOF
+          cat wrangler.ci.jsonc
+
+      # 产出 dist/（官方前端静态资源）—— Workers Static Assets 的目录，必须在 deploy 前生成
+      - name: Build
+        run: pnpm run build
+
+      - name: Deploy
+        run: pnpm exec wrangler deploy -c wrangler.ci.jsonc --yes
+
+      # Secrets 不会被下次 deploy 覆盖，重复写入只为保证幂等
+      - name: Ensure JWT_SECRET
+        env:
+          JWT_SECRET_VALUE: ${{ secrets.JWT_SECRET }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$JWT_SECRET_VALUE" | pnpm exec wrangler secret put JWT_SECRET -c wrangler.ci.jsonc
